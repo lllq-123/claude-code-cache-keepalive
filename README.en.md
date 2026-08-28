@@ -244,12 +244,28 @@ activity**, not the wall clock. Two more common-sense rules: never cold-start
 the main process just to keep a cache warm; while the user is active, real
 requests refresh the TTL anyway — keepalive is only the idle-time backstop.
 
-**Output compression is an optimization, not a requirement**: production
-setups can cap output at 1 token and kill the process group upon the first
-response event (the server has already completed the cache read and refreshed
-the TTL by then). Note CC auto-retries when it sees truncated output, turning
-one keepalive into several requests — killing the whole process group avoids
-that. Keepalive works fine without this layer.
+**Output compression is an optimization, not a requirement** (keepalive
+works fine without it): production setups can cap output at 1 token
+(`CLAUDE_CODE_MAX_OUTPUT_TOKENS=1` — absent from the official docs but
+measured to be a legal value). Know this trap first, though:
+
+- **Truncated output (`stop_reason=max_tokens`) always triggers CC's rescue
+  retry, hard-coded to 3 attempts** — one keepalive becomes 4 requests, each
+  doing a full cache read;
+- **there is no switch**: `CLAUDE_CODE_MAX_RETRIES` governs network-layer
+  errors and has no effect here (the trigger is the stop_reason, not a
+  network failure);
+- **the workaround is a stream-kill**: under `--output-format stream-json`,
+  the `message_start` event carries the complete usage and flows out before
+  the response finishes — the moment you have it, the server has already
+  completed the cache read and refreshed the TTL, so `SIGKILL` the whole
+  process group and the retries never leave the machine. Measured: exactly
+  1 API request;
+- **a reading trap**: in `-p` mode the final `result.usage` is a
+  **whole-run accumulation**, not per-request — 4 rescue attempts make
+  `cache_read` display at 4× the single-shot value. Read it as one request
+  and you will "discover" a phantom hundred-thousand-token injection;
+  divide by the actual request count before concluding anything.
 
 ## Verification: how to read the numbers
 
