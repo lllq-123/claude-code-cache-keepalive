@@ -103,12 +103,14 @@ it burns.**
 | Idling past the TTL | no mismatch, plain expiry | full rebuild |
 | Day rollover in a resume-per-turn runtime (date fields computed at startup) | the very front | full, once a day |
 | Editing CLAUDE.md mid-session | **no mismatch that turn** (the live process never re-reads it) | **deferred blast**: every cache line burns from the first message at its own next rebuild |
-| Installing/editing a skill mid-session | **no mismatch that turn** (an incremental notice is appended at the end) | **deferred blast**: on rebuild the full skill listing near the top is regenerated from current disk and burns from there |
+| Installing a new skill / changing a skill's `name` or `description` mid-session | **no mismatch that turn** (an incremental notice is appended at the end) | **deferred blast**: on rebuild the full skill listing near the top is regenerated from current disk and burns from there |
+| Editing a skill's **body** mid-session | **no mismatch** | **zero**. The skill listing in the prefix carries only `name` + `description`; the body was never in the prefix to begin with (measured on the wire) — edit freely |
 
 The most overlooked row is the first: **the tool table sits at the very front
 of the prefix, so any change to it is the most expensive kind of change.**
-The last two rows are a differently-shaped trap — everything looks fine the
-moment you edit, and the bill arrives later. They get their own section.
+The two "deferred blast" rows are a differently-shaped trap — everything looks
+fine the moment you edit, and the bill arrives later. They get their own
+section.
 
 ## Time your config edits (CLAUDE.md / skills / MCP)
 
@@ -120,10 +122,17 @@ Measured on the wire (three-turn capture with mid-session edits, CC 2.1.175):
 - **Installing a new skill mid-session**: an incremental notice listing only
   the new skill is appended at the end of the current turn, while the full
   skill listing near the top stays untouched — nothing burns within the live
-  process either.
+  process either;
+- **Editing an existing skill's body**: this one is whitelisted. The full
+  skill listing in the prefix carries **only each skill's `name` +
+  `description`, never the body** — the body is appended at the end of
+  `messages` only when the skill is invoked. So editing a body burns nothing,
+  neither that turn nor on rebuild (measured: after a body edit, two bypass
+  keepalive probes hit in full, delta 0). Only **installing a new skill** and
+  **changing `name` / `description`** touch the prefix.
 
-Sounds safe? The danger is precisely in the "later". This content lives at
-the very front of the prompt (CLAUDE.md is spliced into the first message,
+The first two sound safe? The danger is precisely in the "later". This
+content lives at the very front of the prompt (CLAUDE.md is spliced into the first message,
 the full skill listing right after it), and **a process rebuild regenerates
 it from current disk**. Once the config has changed, every existing cache
 line takes one full rewrite at its own next rebuild — reopening a window,
@@ -140,9 +149,19 @@ Three practical rules:
    window, later, each at its own size. Close what you don't need first.
 3. **The first resume / fresh window after an edit does one full rewrite —
    that is expected, don't chase it as a failure.** Keepalive users, note:
-   a config change also makes the bypass probe's rebuilt prefix diverge from
-   the main session's, so the probe starts missing — after config work,
-   let long sessions wind down and reopen sooner rather than later.
+   a config change that reaches the prefix (skill-body edits don't) also
+   makes the bypass probe's rebuilt prefix diverge from the main session's,
+   so the probe starts missing — after config work, let long sessions wind
+   down and reopen sooner rather than later.
+
+One more measured detail that changes *when* the bill lands: **CC's resident
+long-lived process initializes lazily** — a stream-json process does nothing
+after starting (no SessionStart hooks, no MCP connections; measured: the
+event buffer stays empty through 45 minutes of idling) and **only initializes
+from whatever is on disk the moment the first input arrives**. So the bill
+for a config edit is settled not "when a process starts" but "when the next
+process is woken up (receives its first input)" — the process may have been
+up for a long while without ever having read the disk.
 
 ## Resume-per-turn automation: tools must be fully loaded up front
 
@@ -277,6 +296,14 @@ measured to be a legal value). Know this trap first, though:
   at 99–100%; a resume-recovery turn can inherit the previous turn's cache in
   full (`read` exactly equals the previous turn's `read + create`, zero
   collapse).
+  One exception: **when the previous turn ran a long tool chain, the recovery
+  turn falls short by a slice** — a request carries at most 4 cache
+  breakpoints (`cache_control`), so five-plus tool calls in one turn push the
+  earlier breakpoints out, and the recovery turn / keepalive probe can only
+  hit up to some middle step of the chain (one measurement: a +3,791 gap,
+  with `read` exactly equal to the value as of the chain's second step).
+  This is the breakpoint budget's mechanical ceiling, not your replica being
+  off — don't chase it as a failure.
   Note: our environment runs the root fix for the midnight date issue from
   the "Principle" section; a stock setup on a resume-per-turn runtime takes
   one additional predictable full rewrite per day, so its long-run average
@@ -288,6 +315,12 @@ measured to be a legal value). Know this trap first, though:
   cached prefix, changing a name/schema/ordering likewise voids it, writes
   1.25× / reads 0.1×, 30-minute TTL. Switching providers does not opt you out
   of this logic.
+- **Debugging has a bottom**: if one collapse survives every check on this
+  page, stop digging locally. We have seen a class of `read=0` that does not
+  reproduce under identical conditions, where the very next turn reads back
+  the cache line built *before* the collapse — the old line was alive the
+  whole time, it just failed to match once. Rare (3 in 200+ turns in one
+  day); accepting it beats mis-blaming your own config.
 - Everything here was measured on Claude Code 2.1.175; after upgrades,
   re-verify on low-stakes traffic first.
 - Keepalive is a cost optimization, not a necessity. Short-input, regular
