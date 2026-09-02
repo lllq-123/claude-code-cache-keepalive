@@ -7,11 +7,11 @@ lightweight keepalive before the TTL expires.
 [中文说明](README.md)
 
 > [!WARNING]
-> Unofficial community notes, not affiliated with Anthropic. All numbers were
-> measured on Claude Code 2.1.175 against real API usage; behavior may change
+> Unofficial community notes, not affiliated with Anthropic. Numbers were
+> measured on Claude Code 2.1.175 / 2.1.258 against real API usage; behavior may change
 > across CC versions — re-verify before trusting. Sister project:
 > [claude-code-turn-anchor](https://github.com/lllq-123/claude-code-turn-anchor)
-> (burn-after-reading for per-turn injections; resume-per-turn runtimes only).
+> (sparse append-only injection every 15 prompts since 2026-09-02; no transcript rewrite).
 
 ## Read this first: cache collapse heals itself, so you never see it
 
@@ -87,9 +87,9 @@ it burns.**
 - The right way: inject dynamic content (time, status, reminders) at the
   **end of the turn** via a `UserPromptSubmit` hook's `additionalContext`,
   never into the prefix. Per-turn injections accumulate in the transcript;
-  **do not clean the old copies by rewriting the file** — that busts the cache
-  on the next resume, see
-  [turn-anchor's runtime-shape notes](https://github.com/lllq-123/claude-code-turn-anchor#which-runtime-shape-this-fits).
+  **do not clean old copies by rewriting the file** — preserved thinking in
+  Fable 5.1 requires append-only history. See the sparse
+  [turn-anchor](https://github.com/lllq-123/claude-code-turn-anchor) pattern.
 
 ## What burns the cache (behavior list)
 
@@ -103,8 +103,8 @@ it burns.**
 | Idling past the TTL | no mismatch, plain expiry | full rebuild |
 | Day rollover in a resume-per-turn runtime (date fields computed at startup) | the very front | full, once a day |
 | Editing CLAUDE.md mid-session | **no mismatch that turn** (the live process never re-reads it) | **deferred blast**: every cache line burns from the first message at its own next rebuild |
-| Installing a new skill / changing a skill's `name` or `description` mid-session | **no mismatch that turn** (an incremental notice is appended at the end) | **deferred blast**: on rebuild the full skill listing near the top is regenerated from current disk and burns from there |
-| Editing a skill's **body** mid-session | **no mismatch** | **zero**. The skill listing in the prefix carries only `name` + `description`; the body was never in the prefix to begin with (measured on the wire) — edit freely |
+| Editing any `skills/*/SKILL.md` (body, `name`, or `description`) | a bypass probe may temporarily keep hitting the old line | **deferred blast on the next real user message**: the skill listing is before the first cache breakpoint; locally measured `read=0 / create=76,047` |
+| CC 2.1.258 `totalTokensReminder` | appends a dynamic reminder near the tail by default | first-party local sessions did not show a per-turn collapse from it, but 15 million is a padded task budget, not context remaining; top-level `"totalTokensReminder":"off"` disables it and causes one expected cold system-prompt transition |
 
 The most overlooked row is the first: **the tool table sits at the very front
 of the prefix, so any change to it is the most expensive kind of change.**
@@ -114,22 +114,16 @@ section.
 
 ## Time your config edits (CLAUDE.md / skills / MCP)
 
-Measured on the wire (three-turn capture with mid-session edits, CC 2.1.175):
+Current conclusion after combining wire captures with a real-user-turn timeline:
 
 - **Editing CLAUDE.md mid-session**: the new content never appears in any
   subsequent request — the live process simply never re-reads the file.
   Zero effect that turn;
-- **Installing a new skill mid-session**: an incremental notice listing only
-  the new skill is appended at the end of the current turn, while the full
-  skill listing near the top stays untouched — nothing burns within the live
-  process either;
-- **Editing an existing skill's body**: this one is whitelisted. The full
-  skill listing in the prefix carries **only each skill's `name` +
-  `description`, never the body** — the body is appended at the end of
-  `messages` only when the skill is invoked. So editing a body burns nothing,
-  neither that turn nor on rebuild (measured: after a body edit, two bypass
-  keepalive probes hit in full, delta 0). Only **installing a new skill** and
-  **changing `name` / `description`** touch the prefix.
+- **Treat every SKILL.md edit as cache-busting.** A 2.1.175 wire capture showed
+  that body text was absent from the visible listing, but a 2026-09-01 real
+  timeline disproved the extrapolation that bodies were safe: a bypass probe
+  still read 75,995 after the edit, while the next real user message went
+  `read=0 / create=76,047`. The probe is blind to this deferred mismatch.
 
 The first two sound safe? The danger is precisely in the "later". This
 content lives at the very front of the prompt (CLAUDE.md is spliced into the first message,
@@ -147,9 +141,9 @@ Three practical rules:
 2. **Don't edit with a pile of long sessions open.** Every window is an
    independent cache line; one global config edit detonates once per open
    window, later, each at its own size. Close what you don't need first.
-3. **The first resume / fresh window after an edit does one full rewrite —
+3. **The first resume / fresh window / real user turn after an edit may do one full rewrite —
    that is expected, don't chase it as a failure.** Keepalive users, note:
-   a config change that reaches the prefix (skill-body edits don't) also
+   any SKILL.md change also
    makes the bypass probe's rebuilt prefix diverge from the main session's,
    so the probe starts missing — after config work, let long sessions wind
    down and reopen sooner rather than later.

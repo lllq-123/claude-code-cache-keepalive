@@ -5,10 +5,10 @@
 [English README](README.en.md)
 
 > [!WARNING]
-> 非官方社区笔记，不隶属于 Anthropic。所有数字在 Claude Code 2.1.175 +
-> 真实 API usage 上实测；CC 版本升级后行为可能变化，请重新验证再信。
+> 非官方社区笔记，不隶属于 Anthropic。数字来自 Claude Code 2.1.175 / 2.1.258
+> 的真实 API usage；CC 版本升级后行为可能变化，请重新验证再信。
 > 姊妹项目：[claude-code-turn-anchor](https://github.com/lllq-123/claude-code-turn-anchor)
-> （每轮注入的阅后即焚，仅适用每轮 resume 架构）。
+> （已于 2026-09-02 改为每 15 个 prompt 稀疏追加，不再改写 transcript）。
 
 ## 先读这个：缓存崩塌是自愈的，肉眼看不见
 
@@ -73,8 +73,8 @@ jq -r 'select(.type=="assistant" and .message.usage) |
 - 正确做法：时间、状态、提醒这类动态内容，用 `UserPromptSubmit` hook 的
   `additionalContext` 注到**轮末**（token 窗口最近处），别碰前缀。
   注意每轮注入会在 transcript 里累积，历史里的旧注入**不要用改写文件的
-  方式清理**——那会砸掉下次 resume 的缓存，细节见
-  [turn-anchor 的适用架构说明](https://github.com/lllq-123/claude-code-turn-anchor#适用架构先确认你的运行方式)。
+  方式清理**——Fable 5.1 的 preserved thinking 要求历史 append-only。
+  稀疏追加示例见 [turn-anchor](https://github.com/lllq-123/claude-code-turn-anchor)。
 
 ## 什么会烧掉缓存（行为清单）
 
@@ -88,8 +88,8 @@ jq -r 'select(.type=="assistant" and .message.usage) |
 | 闲置超过 TTL | 无失配，单纯过期 | 全量重建 |
 | 每轮 resume 架构跨零点（date 类字段启动时计算） | 最前排 | 全量，每天一次 |
 | 会话中改 CLAUDE.md | 当轮**无失配**（活进程不重读它） | **延迟爆发**：每条缓存线各自的下一次重建时，从第一条消息起全烧 |
-| 会话中装新 skill / 改 skill 的 `name` 或 `description` | 当轮**无失配**（增量通知追加在末尾） | **延迟爆发**：重建时开头的全量 skill 列表按新磁盘重新生成，从那里（很靠前）起全烧 |
-| 会话中改 skill **正文** | **无失配** | **零**。前缀里的 skill 列表只含 `name` + `description`，正文本来就不进前缀（wire 实测），随便改 |
+| 会话中改任何 `skills/*/SKILL.md`（正文 / `name` / `description`） | probe 可能暂时仍命中旧线 | **下一条真实 user 消息延迟爆发**：skill 清单处在第一 cache breakpoint 前，本机实测 `read=0 / create=76,047` |
+| CC 2.1.258 `totalTokensReminder` | 默认在尾部追加动态 reminder | 本机官方路由未见它每轮击穿 cache，但 1500 万是 padded 任务预算、不是 context 余量；可用顶层 `"totalTokensReminder":"off"` 关闭，首次生效会因 system prompt 变化冷一次 |
 
 其中最容易被忽视的是第一行：**工具表在前缀最前面，它的任何变化都是
 最贵的一种变化。**「延迟爆发」那两行则是另一种容易误判的形状——改的当下
@@ -97,17 +97,14 @@ jq -r 'select(.type=="assistant" and .message.usage) |
 
 ## 改配置要挑时机（CLAUDE.md / skills / MCP）
 
-wire 层实测（三轮抓包，会话中途改动，CC 2.1.175）：
+wire 层与真实 user turn 实测合并后的当前结论：
 
 - **会话中改 CLAUDE.md**：后续轮次的请求里完全没有新内容——
   活进程根本不重读它，当轮零感知；
-- **会话中装新 skill**：当轮末尾追加一条只含新 skill 的增量通知，
-  开头的全量 skill 列表原样不动——活进程内同样不烧；
-- **改已有 skill 的正文**：这条是白名单。前缀里的 skill 全量列表
-  **只含每个 skill 的 `name` + `description`，不含正文**——正文只在
-  skill 被调用时才追加到 messages 末尾。所以改正文当轮不烧、重建时
-  也不烧（实测：改完正文后，两次旁路保活探针完整命中、差值 0）。
-  会动前缀的只有**装新 skill**和**改 `name` / `description`**。
+- **任何 SKILL.md 改动都按会烧处理**。2.1.175 wire 抓包曾显示正文不在
+  可见 skill listing 里，但 2026-09-01 真实时序推翻了「正文可以随便改」的
+  外推：改动后旁路 probe 仍命中 75,995，落落下一条真消息却
+  `read=0 / create=76,047`。probe 看不见该类延迟失配，不能拿它为正文背书。
 
 前两条看起来很安全？危险恰恰在"之后"。这些内容住在 prompt 最前排
 （CLAUDE.md 拼在第一条消息里、skill 全量列表紧随其后），
@@ -123,8 +120,8 @@ wire 层实测（三轮抓包，会话中途改动，CC 2.1.175）：
 2. **别开着一堆长会话的时候改。**每个窗口是一条独立缓存线，
    改一次全局配置，开着几个窗，就在之后各爆几份。
    要动配置，先把不必要的窗口收掉。
-3. **改完后的第一次 resume / 新窗全量重写是预期内的，别当故障查。**
-   跑保活的读者额外注意：会进前缀的配置改动（改 skill 正文不算）
+3. **改完后的第一次 resume / 新窗 / 真实 user turn 全量重写是预期内的，别当故障查。**
+   跑保活的读者额外注意：任何 SKILL.md 改动
    同样会让旁路探针重建的前缀跟主会话对不上，探针从此开始 miss——
    改完配置，尽早让长会话自然收尾重开。
 
