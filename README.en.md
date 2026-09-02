@@ -103,34 +103,71 @@ it burns.**
 | Idling past the TTL | no mismatch, plain expiry | full rebuild |
 | Day rollover in a resume-per-turn runtime (date fields computed at startup) | the very front | full, once a day |
 | Editing CLAUDE.md mid-session | **no mismatch that turn** (the live process never re-reads it) | **deferred blast**: every cache line burns from the first message at its own next rebuild |
-| Editing any `skills/*/SKILL.md` (body, `name`, or `description`) | a bypass probe may temporarily keep hitting the old line | **deferred blast on the next real user message**: the skill listing is before the first cache breakpoint; locally measured `read=0 / create=76,047` |
+| Editing any `skills/*/SKILL.md` (**≤ 2.1.175**) | a bypass probe may temporarily keep hitting the old line | **deferred blast on the next real user message**: the skill listing is before the first cache breakpoint; locally measured `read=0 / create=76,047` |
+| Editing `skills/*/SKILL.md` (**2.1.258 onward**) | no mismatch | **zero**. The listing moved out from before the first cache breakpoint; all four measured cells hit in full — see the next section |
 | CC 2.1.258 `totalTokensReminder` | appends a dynamic reminder near the tail by default | first-party local sessions did not show a per-turn collapse from it, but 15 million is a padded task budget, not context remaining; top-level `"totalTokensReminder":"off"` disables it and causes one expected cold system-prompt transition |
 
 The most overlooked row is the first: **the tool table sits at the very front
 of the prefix, so any change to it is the most expensive kind of change.**
 The two "deferred blast" rows are a differently-shaped trap — everything looks
-fine the moment you edit, and the bill arrives later. They get their own
-section.
+fine the moment you edit, and the bill arrives later. The skill row has also
+flipped across CC versions; both are unpacked in the next section.
 
 ## Time your config edits (CLAUDE.md / skills / MCP)
 
-Current conclusion after combining wire captures with a real-user-turn timeline:
+**The conclusion forks by CC version**, and the three kinds of config differ:
 
 - **Editing CLAUDE.md mid-session**: the new content never appears in any
   subsequent request — the live process simply never re-reads the file.
-  Zero effect that turn;
-- **Treat every SKILL.md edit as cache-busting.** A 2.1.175 wire capture showed
-  that body text was absent from the visible listing, but a 2026-09-01 real
-  timeline disproved the extrapolation that bodies were safe: a bypass probe
-  still read 75,995 after the edit, while the next real user message went
-  `read=0 / create=76,047`. The probe is blind to this deferred mismatch.
+  Zero effect that turn; the bill lands at the next rebuild (below).
 
-The first two sound safe? The danger is precisely in the "later". This
-content lives at the very front of the prompt (CLAUDE.md is spliced into the first message,
-the full skill listing right after it), and **a process rebuild regenerates
-it from current disk**. Once the config has changed, every existing cache
-line takes one full rewrite at its own next rebuild — reopening a window,
-resuming, or a bypass keepalive probe.
+- **Editing `skills/*/SKILL.md`: from 2.1.258 on it does not burn at all.**
+  A four-cell matrix — process restarted or not × skill edited or not — hits
+  in full in every cell, each one landing exactly on the previous turn's
+  `read` + `create`, not a token off:
+
+  | | Same process | Restarted, then resumed |
+  |---|---|---|
+  | skill unchanged | `read=34,475` ✅ | `read=34,814` ✅ |
+  | skill changed (one installed) | `read=34,604` ✅ | `read=34,989` ✅ |
+
+  Presumably 258 moved the full skill listing out from before the first cache
+  breakpoint. **Stating the boundary honestly**: these numbers come from
+  `claude-fable-5-1[1m]`, and other models on the same version were not
+  measured. The listing's position should be a client-side decision,
+  independent of the model — but that sentence is an inference, not a
+  measurement.
+
+- **The same thing is the opposite on ≤ 2.1.175: treat every SKILL.md edit as
+  cache-busting.** A wire capture showed body text was absent from the visible
+  listing, but a 2026-09-01 real timeline disproved the extrapolation that
+  bodies were safe — a bypass probe still read 75,995 after the edit, while
+  the next real user message went `read=0 / create=76,047`. **The probe is
+  blind to this class of deferred mismatch** and cannot vouch for either side.
+  Readers on older versions should follow this row.
+
+- **Editing MCP config / server scripts: still burns; 258 changed nothing
+  here.** It lands in the request's `tools` segment (the very front of the
+  prefix) — a different mechanism from the skill listing.
+  **And there is no backstop to play**: having the live process send a turn
+  itself does hit — it is holding the tool table it connected to at startup —
+  but that cache line only lives as long as the process does. The next process
+  to resume picks up the new tool table, and the prefix is void from the front
+  anyway. Our own keepalive chain walked into this: the patch-up turn hit, and
+  the process restart right behind it settled the bill unchanged.
+  **Once the tool table changes, that line is already doomed to rebuild;
+  anything you send afterwards only defers the bill.**
+  (One measurement: adding a tool gave `read=0 / create=35,831`; reverting
+  restored `read=35,672` exactly; adding it back and doing a real resume
+  dropped to `read=19,176`.)
+
+The CLAUDE.md row sounds safe? The danger is precisely in the "later". It
+lives at the very front of the prompt (spliced into the first message), and
+**a process rebuild regenerates it from current disk**. Once it has changed,
+every existing cache line takes one full rewrite at its own next rebuild —
+reopening a window, resuming, or a bypass keepalive probe. On ≤ 2.1.175 the
+full skill listing sits right behind CLAUDE.md and behaves the same way;
+**from 258 on it moved away and no longer belongs to this class**.
 
 Three practical rules:
 
@@ -143,10 +180,10 @@ Three practical rules:
    window, later, each at its own size. Close what you don't need first.
 3. **The first resume / fresh window / real user turn after an edit may do one full rewrite —
    that is expected, don't chase it as a failure.** Keepalive users, note:
-   any SKILL.md change also
-   makes the bypass probe's rebuilt prefix diverge from the main session's,
-   so the probe starts missing — after config work, let long sessions wind
-   down and reopen sooner rather than later.
+   config changes that do reach the prefix (**SKILL.md no longer counts from
+   258 on**) also make the bypass probe's rebuilt prefix diverge from the main
+   session's, so the probe starts missing — after config work, let long
+   sessions wind down and reopen sooner rather than later.
 
 One more measured detail that changes *when* the bill lands: **CC's resident
 long-lived process initializes lazily** — a stream-json process does nothing
@@ -315,8 +352,11 @@ measured to be a legal value). Know this trap first, though:
   the cache line built *before* the collapse — the old line was alive the
   whole time, it just failed to match once. Rare (3 in 200+ turns in one
   day); accepting it beats mis-blaming your own config.
-- Everything here was measured on Claude Code 2.1.175; after upgrades,
-  re-verify on low-stakes traffic first.
+- The numbers here were measured on Claude Code 2.1.175 and 2.1.258
+  respectively, and **the conclusions fork by version** — the skill row is the
+  living example: one release voided it entirely. After an upgrade, re-verify
+  on low-stakes traffic first, and don't inherit anyone's old conclusions,
+  this document's included.
 - Keepalive is a cost optimization, not a necessity. Short-input, regular
   automated requests are themselves a recognizable usage shape — weigh it
   yourself; this document's stance is that randomization and
