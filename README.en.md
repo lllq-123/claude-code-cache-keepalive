@@ -106,14 +106,16 @@ it burns.**
 | Day rollover in a resume-per-turn runtime (date fields computed at startup) | the very front | full, once a day |
 | Editing CLAUDE.md mid-session | **no mismatch that turn** (the live process never re-reads it) | **deferred blast**: every cache line burns from the first message at its own next rebuild |
 | Editing any `skills/*/SKILL.md` (**≤ 2.1.175**) | a bypass probe may temporarily keep hitting the old line | **deferred blast on the next real user message**: the skill listing is before the first cache breakpoint; locally measured `read=0 / create=76,047` |
-| Editing `skills/*/SKILL.md` (**2.1.258 onward**) | no mismatch | **zero**. The listing moved out from before the first cache breakpoint; all four measured cells hit in full — see the next section |
+| **Adding** a new `skills/*/SKILL.md` (**2.1.258 onward**) | no mismatch | **zero**. All four measured cells hit in full — see the next section |
+| **Editing an existing** `skills/*/SKILL.md` (**2.1.258 onward**, with a live process present) | the live process still hits that turn | **deferred blast, messages segment only**: any later request that rebuilds the prefix from disk (a bypass probe, a resume after restart) reads back only tools + system, locally `read=19,055` — see the next section |
 | CC 2.1.258 `totalTokensReminder` | appends a dynamic reminder near the tail by default | first-party local sessions did not show a per-turn collapse from it, but 15 million is a padded task budget, not context remaining; top-level `"totalTokensReminder":"off"` disables it and causes one expected cold system-prompt transition |
 
 The most overlooked row is the first: **the tool table sits at the very front
 of the prefix, so any change to it is the most expensive kind of change.**
 The two "deferred blast" rows are a differently-shaped trap — everything looks
 fine the moment you edit, and the bill arrives later. The skill row has also
-flipped across CC versions; both are unpacked in the next section.
+flipped across CC versions, and "adding one" vs "editing an existing one" are
+two different things; both are unpacked in the next section.
 
 ## Time your config edits (CLAUDE.md / skills / MCP)
 
@@ -123,22 +125,41 @@ flipped across CC versions; both are unpacked in the next section.
   subsequent request — the live process simply never re-reads the file.
   Zero effect that turn; the bill lands at the next rebuild (below).
 
-- **Editing `skills/*/SKILL.md`: from 2.1.258 on it does not burn at all.**
-  A four-cell matrix — process restarted or not × skill edited or not — hits
-  in full in every cell, each one landing exactly on the previous turn's
-  `read` + `create`, not a token off:
+- **Editing `skills/*/SKILL.md`: from 2.1.258 on, "adding one" and "editing
+  an existing one" are two different stories.**
+
+  **Adding a new skill does not burn.** A four-cell matrix — process restarted
+  or not × a new skill installed or not — hits in full in every cell, each one
+  landing exactly on the previous turn's `read` + `create`, not a token off:
 
   | | Same process | Restarted, then resumed |
   |---|---|---|
   | skill unchanged | `read=34,475` ✅ | `read=34,814` ✅ |
-  | skill changed (one installed) | `read=34,604` ✅ | `read=34,989` ✅ |
+  | one new skill installed | `read=34,604` ✅ | `read=34,989` ✅ |
 
-  Presumably 258 moved the full skill listing out from before the first cache
-  breakpoint. **Stating the boundary honestly**: these numbers come from
-  `claude-fable-5-1[1m]`, and other models on the same version were not
-  measured. The listing's position should be a client-side decision,
-  independent of the model — but that sentence is an inference, not a
-  measurement.
+  **Editing the body of an existing skill burns, provided a live process is
+  present when you edit.** Same channel, same model, same probe, the only
+  variable swapped to "edit an existing skill's body": the bypass probe read
+  `19,055` — only the tools + system part of the prefix came back, the
+  messages segment was rewritten in full (control: after installing a new
+  skill the same probe read `34,686`). Kill the process first, edit, then
+  bring it back up: `read=212,713`, an exact hit. So two conditions must hold
+  together: ① the skill already existed; ② a live process was present during
+  the edit. The live process itself is unaffected that turn; the bill lands on
+  the next request that rebuilds the prefix from disk — a bypass probe, a
+  resume after restart — **the same deferred-blast shape as the CLAUDE.md
+  row**: the messages segment is rewritten from the top, tools + system still
+  read back.
+
+  The mechanism is unverified; two hypotheses coexist: the client keeps a
+  per-skill content or byte-count record and touching an existing one breaks
+  the prefix; or the live process holds both the old listing and the change
+  notification, so an edit leaves an extra stale copy. Don't write either one
+  down as fact. Two measured ways out: **revert byte-for-byte and it
+  recovers**; **kill the process before editing**, then bring it back.
+
+  **Stating the boundary honestly**: these numbers come from
+  `claude-fable-5-1[1m]`; other models on the same version were not measured.
 
 - **The same thing is the opposite on ≤ 2.1.175: treat every SKILL.md edit as
   cache-busting.** A wire capture showed body text was absent from the visible
@@ -169,7 +190,8 @@ lives at the very front of the prompt (spliced into the first message), and
 every existing cache line takes one full rewrite at its own next rebuild —
 reopening a window, resuming, or a bypass keepalive probe. On ≤ 2.1.175 the
 full skill listing sits right behind CLAUDE.md and behaves the same way;
-**from 258 on it moved away and no longer belongs to this class**.
+**from 258 on, adding a skill no longer belongs to this class — editing an
+existing one still does** (see above).
 
 Three practical rules:
 
@@ -182,8 +204,8 @@ Three practical rules:
    window, later, each at its own size. Close what you don't need first.
 3. **The first resume / fresh window / real user turn after an edit may do one full rewrite —
    that is expected, don't chase it as a failure.** Keepalive users, note:
-   config changes that do reach the prefix (**SKILL.md no longer counts from
-   258 on**) also make the bypass probe's rebuilt prefix diverge from the main
+   config changes that do reach the prefix (**from 258 on a new SKILL.md no
+   longer counts; editing an existing one does**) also make the bypass probe's rebuilt prefix diverge from the main
    session's, so the probe starts missing — after config work, let long
    sessions wind down and reopen sooner rather than later.
 
@@ -370,7 +392,8 @@ measured to be a legal value). Know this trap first, though:
   day); accepting it beats mis-blaming your own config.
 - The numbers here were measured on Claude Code 2.1.175 and 2.1.258
   respectively, and **the conclusions fork by version** — the skill row is the
-  living example: one release voided it entirely. After an upgrade, re-verify
+  living example: one release flipped the "adding" half, while the "editing an
+  existing one" half still burns. After an upgrade, re-verify
   on low-stakes traffic first, and don't inherit anyone's old conclusions,
   this document's included.
 - Keepalive is a cost optimization, not a necessity. Short-input, regular
