@@ -87,8 +87,10 @@ it burns.**
 - The right way: inject dynamic content (time, status, reminders) at the
   **end of the turn** via a `UserPromptSubmit` hook's `additionalContext`,
   never into the prefix. Per-turn injections accumulate in the transcript;
-  **do not clean old copies by rewriting the file** — preserved thinking in
-  Fable 5.1 requires append-only history. See the sparse
+  **do not clean old copies by rewriting the file** — measured since
+  2026-09-02: a session whose history was rewritten misses on the next turn.
+  Whether that comes from the model (Fable 5.1 landed the same day) or from
+  the server side, I have not isolated; judge for yourself. See the sparse
   [turn-anchor](https://github.com/lllq-123/claude-code-turn-anchor) pattern.
 
 ## What burns the cache (behavior list)
@@ -286,6 +288,20 @@ timeout 30 claude -p --resume "$SESSION_ID" --no-session-persistence \
     alive. Go diff your flags and env.
 
 Full example: [`examples/keepalive.sh`](examples/keepalive.sh).
+
+**What the probe's "config consistency check" should compare against**:
+anyone running a bypass probe eventually adds a check — "config changed; does
+the prefix the probe rebuilds still match the main session?" — and stops
+firing on mismatch. The right baseline for "changed?" is **the moment the
+main process was started** (strictly, the moment it received its first input
+and actually read the disk — see the previous section; process start is
+easier to obtain and only errs on the conservative side): an edit earlier
+than that is what the main process read, so the probe's replica necessarily
+matches; only edits after it are dangerous. **Do not use "the fingerprint
+recorded at the last check" as the baseline** — it may be days old, and it
+will flag an edit the main process already absorbed as "new", stopping
+keepalive for nothing until the TTL lapses. We lost a line of well over a
+hundred thousand tokens exactly this way on 2026-09-02.
 
 **Randomize the interval**: a fixed request cadence is a textbook automation
 fingerprint; out of caution, don't use one. Draw from a range close to the

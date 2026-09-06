@@ -73,7 +73,8 @@ jq -r 'select(.type=="assistant" and .message.usage) |
 - 正确做法：时间、状态、提醒这类动态内容，用 `UserPromptSubmit` hook 的
   `additionalContext` 注到**轮末**（token 窗口最近处），别碰前缀。
   注意每轮注入会在 transcript 里累积，历史里的旧注入**不要用改写文件的
-  方式清理**——Fable 5.1 的 preserved thinking 要求历史 append-only。
+  方式清理**——2026-09-02 起实测：改过历史的会话，下一轮必 miss。是模型
+  （当天换到 Fable 5.1）还是服务端导致的，我没有单独验证过，各位自己看着办。
   稀疏追加示例见 [turn-anchor](https://github.com/lllq-123/claude-code-turn-anchor)。
 
 ## 什么会烧掉缓存（行为清单）
@@ -234,6 +235,15 @@ timeout 30 claude -p --resume "$SESSION_ID" --no-session-persistence \
     白花钱还没保到活——回去 diff 参数和 env。
 
 完整示例见 [`examples/keepalive.sh`](examples/keepalive.sh)。
+
+**探针的"配置一致性检查"拿什么当基准**：做了旁路探针的人迟早会加一道检查——
+"配置改过了，探针复刻出来的前缀还跟主会话对得上吗"，对不上就停发。
+判断"改过没"的基准应该是**主进程拉起的那一刻**（严格说是它收到首条输入、
+真正读盘的那一刻，见上一节；拉起时刻更容易取到，只会偏保守）：改动早于它，
+主进程读到的就是当前这份，探针复刻必然一致；晚于它才危险。
+**别拿"上次检查时记下的指纹"当基准**——那可能是几天前的，会把主进程早已
+吃进去的改动判成"新变更"，白停保活直到 TTL 过期。我们自己 2026-09-02 就这样
+凉过一次十几万 token 的线。
 
 **间隔随机化**：固定间隔的请求节奏是典型的自动化指纹，谨慎起见别用。
 在贴近 TTL 的区间内随机取值（如 1 小时 TTL → 50–58 分钟均匀随机），
