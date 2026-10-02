@@ -304,7 +304,7 @@ timeout 30 claude -p --resume "$SESSION_ID" --no-session-persistence \
 - replicate the main session's flags, env, and cwd per the previous section —
   **the fidelity of the replica decides whether it hits**;
 - verify via `--output-format stream-json` usage:
-  - `cache_read > 0` ✅ the cache line was carried forward;
+  - `cache_read > 0`: a cached prefix was hit; compare the expected main-session prefix and subsequent real requests to establish that it was the intended cache line;
   - `read = 0` with `create > 0` ❌ the replica didn't match — this shot
     **built a separate new cache line**, spending money while keeping nothing
     alive. Go diff your flags and env.
@@ -324,6 +324,18 @@ recorded at the last check" as the baseline** — it may be days old, and it
 will flag an edit the main process already absorbed as "new", stopping
 keepalive for nothing until the TTL lapses. We lost a line of well over a
 hundred thousand tokens exactly this way on 2026-09-02.
+
+The timestamp rule covers files on disk. For content obtained **at runtime**,
+such as MCP tools, compare the actual inventories observed when the main
+process and probe initialize: tool names, definitions, and connection status.
+Identical configuration files do not guarantee identical tool connections.
+Do not use an old inventory saved only on success as a permanent baseline:
+after a failure, that design can prevent the very success needed to refresh it.
+
+If a normal request is queued to rebuild a cold cache, **queued does not mean
+rebuilt**. Inspect that request's actual usage and whether subsequent real
+requests recover their expected `cache_read`. A probe's own `ok` only establishes
+that it hit some cached prefix.
 
 **Randomize the interval**: a fixed request cadence is a textbook automation
 fingerprint; out of caution, don't use one. Draw from a range close to the
